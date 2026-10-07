@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-REPO="${SUNDY_REPO:-SundySystems/sundy-toolkit}"
+REPO="${SUNDY_REPO:-Kreativ10/Sundy-Toolkit}"
 INSTALL_DIR="${SUNDY_INSTALL_DIR:-/usr/local/bin}"
 VERSION="${SUNDY_VERSION:-latest}"
 
