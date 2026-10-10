@@ -17,6 +17,7 @@ jobs:
           go-version-file: go.mod
           cache: true
       - run: gofmt -w . && git diff --exit-code
-      - run: go vet ./...
-      - run: go test ./...
-      - run: CGO_ENABLED=0 go build -trimpath ./cmd/sundy
+      - run: make check
+      - run: make smoke
+      - name: Shell lint
+        run: shellcheck installer/*.sh scripts/*.sh scripts/integration/*.sh

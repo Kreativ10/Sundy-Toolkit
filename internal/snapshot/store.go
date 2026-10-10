@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -43,7 +44,12 @@ func stateDir() string {
 }
 func (s Store) SnapDir(id string) string { return filepath.Join(s.Base, "snapshots", id) }
 
+var snapshotIDRx = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
+
 func (s Store) Create(name, typ string, components []string, automatic bool) (Meta, error) {
+	if !snapshotIDRx.MatchString(typ) {
+		return Meta{}, fmt.Errorf("invalid snapshot type %q", typ)
+	}
 	host, _ := os.Hostname()
 	id := fmt.Sprintf("%s-%s", strings.ReplaceAll(typ, "/", "-"), time.Now().Format("20060102-150405.000000000"))
 	m := Meta{ID: id, Name: name, Type: typ, Created: time.Now(), Hostname: host, Platform: platform.Detect(), Components: components, Automatic: automatic}
@@ -57,6 +63,9 @@ func (s Store) Create(name, typ string, components []string, automatic bool) (Me
 	return m, nil
 }
 func (s Store) Update(m Meta) error {
+	if !snapshotIDRx.MatchString(m.ID) {
+		return fmt.Errorf("invalid snapshot ID")
+	}
 	return util.WriteJSON(filepath.Join(s.SnapDir(m.ID), "meta.json"), m, 0600)
 }
 func (s Store) Get(idOrName string) (Meta, error) {
@@ -86,7 +95,7 @@ func (s Store) List() ([]Meta, error) {
 			continue
 		}
 		var m Meta
-		if util.ReadJSON(filepath.Join(root, e.Name(), "meta.json"), &m) == nil {
+		if util.ReadJSON(filepath.Join(root, e.Name(), "meta.json"), &m) == nil && m.ID == e.Name() && snapshotIDRx.MatchString(m.ID) {
 			out = append(out, m)
 		}
 	}
@@ -95,8 +104,12 @@ func (s Store) List() ([]Meta, error) {
 }
 
 func ArchivePaths(dst string, paths []string) error {
-	f, err := os.Create(dst)
+	f, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
 	if err != nil {
+		return err
+	}
+	if err := f.Chmod(0600); err != nil {
+		f.Close()
 		return err
 	}
 	gz := gzip.NewWriter(f)
@@ -124,11 +137,14 @@ func ArchivePaths(dst string, paths []string) error {
 		}
 		seen[root] = true
 		if _, err := os.Lstat(root); err != nil {
-			continue
+			if os.IsNotExist(err) {
+				continue
+			}
+			return closeAll(err)
 		}
 		err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
-				return nil
+				return err
 			}
 			hdr, err := tar.FileInfoHeader(info, "")
 			if err != nil {
@@ -160,60 +176,7 @@ func ArchivePaths(dst string, paths []string) error {
 	return closeAll(nil)
 }
 
-func ExtractArchive(src string) error {
-	f, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	gz, err := gzip.NewReader(f)
-	if err != nil {
-		return err
-	}
-	defer gz.Close()
-	tr := tar.NewReader(gz)
-	for {
-		hdr, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return err
-		}
-		clean := filepath.Clean("/" + hdr.Name)
-		if clean == "/" || strings.Contains(clean, "..") {
-			continue
-		}
-		switch hdr.Typeflag {
-		case tar.TypeDir:
-			if err := os.MkdirAll(clean, os.FileMode(hdr.Mode)); err != nil {
-				return err
-			}
-		case tar.TypeSymlink:
-			_ = os.Remove(clean)
-			if err := os.MkdirAll(filepath.Dir(clean), 0755); err != nil {
-				return err
-			}
-			if err := os.Symlink(hdr.Linkname, clean); err != nil {
-				return err
-			}
-		case tar.TypeReg:
-			if err := os.MkdirAll(filepath.Dir(clean), 0755); err != nil {
-				return err
-			}
-			wf, err := os.OpenFile(clean, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(hdr.Mode))
-			if err != nil {
-				return err
-			}
-			_, cp := io.Copy(wf, tr)
-			wf.Close()
-			if cp != nil {
-				return cp
-			}
-		}
-	}
-	return nil
-}
+func ExtractArchive(src string) error { return util.ExtractTGZ(src, "/") }
 
 func SaveText(path string, v any) error {
 	b, err := json.MarshalIndent(v, "", "  ")

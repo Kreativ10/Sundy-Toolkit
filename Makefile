@@ -2,7 +2,7 @@ APP := sundy
 VERSION ?= 0.1.0
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
-.PHONY: build test lint clean dist
+.PHONY: build test lint check smoke clean dist
 
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/$(APP) ./cmd/sundy
@@ -12,6 +12,14 @@ test:
 
 lint:
 	go vet ./...
+
+check: lint
+	go test -race ./...
+	for script in installer/*.sh scripts/*.sh scripts/integration/*.sh; do sh -n "$$script" || exit 1; done
+	sh scripts/test-installer.sh
+
+smoke: build
+	sh scripts/smoke.sh
 
 dist: test
 	mkdir -p dist

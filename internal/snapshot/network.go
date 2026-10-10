@@ -1,12 +1,14 @@
 package snapshot
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/SundySystems/sundy-toolkit/internal/platform"
 	"github.com/SundySystems/sundy-toolkit/internal/util"
 )
 
@@ -34,9 +36,16 @@ func (s Store) SaveNetwork(name string, selected []int, automatic bool) (Meta, e
 	for _, i := range selected {
 		selectedMap[i] = true
 	}
+	var captureErrors []error
 	capture := func(file, cmd string, args ...string) {
 		r := util.Run(8*time.Second, cmd, args...)
-		_ = os.WriteFile(filepath.Join(d, file), []byte(r.Stdout+"\n"), 0600)
+		if r.Code != 0 {
+			m.Notes += fmt.Sprintf("%s unavailable: %s; ", file, r.Stderr)
+			return
+		}
+		if err := os.WriteFile(filepath.Join(d, file), []byte(r.Stdout+"\n"), 0600); err != nil {
+			captureErrors = append(captureErrors, err)
+		}
 	}
 	if selectedMap[0] {
 		capture("ip-address.txt", "ip", "-details", "addr", "show")
@@ -75,11 +84,15 @@ func (s Store) SaveNetwork(name string, selected []int, automatic bool) (Meta, e
 		}
 	}
 	if len(configPaths) > 0 {
-		_ = ArchivePaths(filepath.Join(d, "config.tar.gz"), configPaths)
+		if err := ArchivePaths(filepath.Join(d, "config.tar.gz"), configPaths); err != nil {
+			captureErrors = append(captureErrors, err)
+		}
 	}
-	m.Notes = "Transient interface/route state is captured for diagnosis; persistent configuration files are restorable."
-	_ = s.Update(m)
-	return m, nil
+	m.Notes += "Transient interface/route state is captured for diagnosis; persistent configuration files are restorable."
+	if err := s.Update(m); err != nil {
+		captureErrors = append(captureErrors, err)
+	}
+	return m, errors.Join(captureErrors...)
 }
 
 func (s Store) RestoreNetwork(idOrName string, apply bool) error {
@@ -109,26 +122,23 @@ func (s Store) RestoreNetwork(idOrName string, apply bool) error {
 		return fmt.Errorf("could not create emergency rollback snapshot: %w", err)
 	}
 	if err := ExtractArchive(archive); err != nil {
-		return err
+		rollbackErr := ExtractArchive(filepath.Join(s.SnapDir(rollback.ID), "config.tar.gz"))
+		return errors.Join(fmt.Errorf("restore failed; rollback attempted: %w", err), rollbackErr)
 	}
 	reloadErr := reloadNetwork()
 	if reloadErr != nil {
 		rb := filepath.Join(s.SnapDir(rollback.ID), "config.tar.gz")
-		_ = ExtractArchive(rb)
-		_ = reloadNetwork()
-		return fmt.Errorf("network reload failed and rollback was attempted: %w", reloadErr)
+		return errors.Join(fmt.Errorf("network reload failed; rollback attempted: %w", reloadErr), ExtractArchive(rb), reloadNetwork())
 	}
 	if !connectivityOK() {
 		rb := filepath.Join(s.SnapDir(rollback.ID), "config.tar.gz")
-		_ = ExtractArchive(rb)
-		_ = reloadNetwork()
-		return fmt.Errorf("connectivity verification failed; automatic rollback attempted")
+		return errors.Join(fmt.Errorf("connectivity verification failed; automatic rollback attempted"), ExtractArchive(rb), reloadNetwork())
 	}
 	return nil
 }
 
 func reloadNetwork() error {
-	if util.Exists("nmcli") {
+	if util.Exists("nmcli") && util.Run(5*time.Second, "nmcli", "-t", "-f", "RUNNING", "general").Stdout == "running" {
 		r := util.Run(20*time.Second, "nmcli", "connection", "reload")
 		if r.Code != 0 {
 			return fmt.Errorf("nmcli reload: %s", r.Stderr)
@@ -146,13 +156,6 @@ func reloadNetwork() error {
 		}
 		return nil
 	}
-	if util.Exists("networkctl") {
-		r := util.Run(20*time.Second, "networkctl", "reload")
-		if r.Code != 0 {
-			return fmt.Errorf("networkctl reload: %s", r.Stderr)
-		}
-		return nil
-	}
 	if util.Exists("netplan") {
 		r := util.Run(30*time.Second, "netplan", "apply")
 		if r.Code != 0 {
@@ -160,11 +163,18 @@ func reloadNetwork() error {
 		}
 		return nil
 	}
-	return nil
+	if util.Exists("networkctl") && platform.Services().State("systemd-networkd") == "active" {
+		r := util.Run(20*time.Second, "networkctl", "reload")
+		if r.Code != 0 {
+			return fmt.Errorf("networkctl reload: %s", r.Stderr)
+		}
+		return nil
+	}
+	return fmt.Errorf("no supported active network backend detected")
 }
 func connectivityOK() bool {
 	if !util.Exists("ip") {
-		return true
+		return false
 	}
 	r := util.Run(4*time.Second, "ip", "route", "show", "default")
 	if strings.TrimSpace(r.Stdout) == "" {

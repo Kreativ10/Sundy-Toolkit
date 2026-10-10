@@ -160,6 +160,9 @@ type ServiceManager struct{ Init string }
 
 func Services() ServiceManager { return ServiceManager{Init: detectInit()} }
 func (s ServiceManager) Action(action, name string) error {
+	if err := validateService(action, name); err != nil {
+		return err
+	}
 	switch s.Init {
 	case "systemd":
 		return util.RunStreaming("systemctl", action, name)
@@ -173,6 +176,9 @@ func (s ServiceManager) Action(action, name string) error {
 			return util.RunStreaming("rc-update", "del", name, "default")
 		}
 	case "runit":
+		if action == "enable" || action == "disable" {
+			return fmt.Errorf("runit enable/disable requires explicit service directory configuration")
+		}
 		if action == "start" {
 			action = "up"
 		}
@@ -184,6 +190,9 @@ func (s ServiceManager) Action(action, name string) error {
 	return fmt.Errorf("unsupported init system: %s", s.Init)
 }
 func (s ServiceManager) State(name string) string {
+	if validateService("status", name) != nil {
+		return "unknown"
+	}
 	switch s.Init {
 	case "systemd":
 		r := util.Run(3*time.Second, "systemctl", "is-active", name)
@@ -202,10 +211,22 @@ func (s ServiceManager) State(name string) string {
 		return "inactive"
 	case "runit":
 		r := util.Run(3*time.Second, "sv", "status", name)
-		if r.Code == 0 {
+		if r.Code == 0 && strings.HasPrefix(r.Stdout, "run:") {
 			return "active"
 		}
 		return "inactive"
 	}
 	return "unknown"
+}
+
+func validateService(action, name string) error {
+	switch action {
+	case "start", "stop", "restart", "status", "enable", "disable":
+	default:
+		return fmt.Errorf("unsupported service action %q", action)
+	}
+	if name == "" || strings.HasPrefix(name, "-") || strings.ContainsAny(name, "/\x00\r\n\t ") {
+		return fmt.Errorf("invalid service name %q", name)
+	}
+	return nil
 }

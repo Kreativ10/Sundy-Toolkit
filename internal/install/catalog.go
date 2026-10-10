@@ -12,6 +12,7 @@ type Preset struct {
 	ID, Name, Category, Description string
 	Packages                        map[string][]string
 	Services                        []string
+	ServiceByPackage                map[string][]string
 	Notes                           []string
 }
 
@@ -24,7 +25,7 @@ var Catalog = []Preset{
 	{ID: "caddy", Name: "Caddy", Category: "Web", Description: "Automatic-HTTPS web server (package availability varies by distro).", Packages: all("caddy"), Services: []string{"caddy"}},
 	{ID: "postgresql", Name: "PostgreSQL", Category: "Database", Description: "PostgreSQL server from distribution repositories.", Packages: all("postgresql"), Services: []string{"postgresql"}},
 	{ID: "mariadb", Name: "MariaDB", Category: "Database", Description: "MariaDB server.", Packages: map[string][]string{"apt-get": {"mariadb-server"}, "dnf": {"mariadb-server"}, "yum": {"mariadb-server"}, "pacman": {"mariadb"}, "apk": {"mariadb", "mariadb-client"}, "zypper": {"mariadb"}}, Services: []string{"mariadb"}},
-	{ID: "redis", Name: "Redis", Category: "Database", Description: "Redis/Valkey-compatible in-memory datastore.", Packages: map[string][]string{"apt-get": {"redis-server"}, "dnf": {"redis"}, "yum": {"redis"}, "pacman": {"redis"}, "apk": {"redis"}, "zypper": {"redis"}}, Services: []string{"redis", "redis-server"}},
+	{ID: "redis", Name: "Redis", Category: "Database", Description: "Redis/Valkey-compatible in-memory datastore.", Packages: map[string][]string{"apt-get": {"redis-server"}, "dnf": {"redis"}, "yum": {"redis"}, "pacman": {"redis"}, "apk": {"redis"}, "zypper": {"redis"}}, Services: []string{"redis"}, ServiceByPackage: map[string][]string{"apt-get": {"redis-server"}}},
 	{ID: "wireguard", Name: "WireGuard", Category: "Network", Description: "WireGuard VPN userspace tooling.", Packages: map[string][]string{"apt-get": {"wireguard-tools"}, "dnf": {"wireguard-tools"}, "yum": {"wireguard-tools"}, "pacman": {"wireguard-tools"}, "apk": {"wireguard-tools"}, "zypper": {"wireguard-tools"}}},
 	{ID: "fail2ban", Name: "Fail2ban", Category: "Security", Description: "Log-driven banning framework.", Packages: all("fail2ban"), Services: []string{"fail2ban"}},
 	{ID: "kvm", Name: "KVM / libvirt", Category: "Virtualization", Description: "Virtualization host packages.", Packages: map[string][]string{"apt-get": {"qemu-kvm", "libvirt-daemon-system", "libvirt-clients", "bridge-utils"}, "dnf": {"qemu-kvm", "libvirt", "virt-install"}, "yum": {"qemu-kvm", "libvirt", "virt-install"}, "pacman": {"qemu-full", "libvirt", "virt-install", "dnsmasq"}, "zypper": {"qemu-kvm", "libvirt", "virt-install"}}, Services: []string{"libvirtd"}},
@@ -55,18 +56,27 @@ func InstallPreset(p Preset) error {
 		return err
 	}
 	sm := platform.Services()
-	for _, svc := range p.Services {
-		if sm.State(svc) != "unknown" {
-			_ = sm.Action("enable", svc)
-			_ = sm.Action("start", svc)
-			if sm.State(svc) == "active" {
-				continue
-			}
+	for _, svc := range serviceNames(p, pm.Name) {
+		if err := sm.Action("enable", svc); err != nil {
+			return fmt.Errorf("packages installed, but enabling %s failed: %w", svc, err)
+		}
+		if err := sm.Action("start", svc); err != nil {
+			return fmt.Errorf("packages installed, but starting %s failed: %w", svc, err)
+		}
+		if state := sm.State(svc); state != "active" {
+			return fmt.Errorf("packages installed, but %s is %s; inspect service logs and distribution initialization requirements", svc, state)
 		}
 	}
 	return nil
 }
 func Plan(p Preset) string {
 	pm := platform.Packages()
-	return fmt.Sprintf("Preset: %s\nCategory: %s\nPackages (%s): %s\nServices: %s", p.Name, p.Category, pm.Name, strings.Join(p.Packages[pm.Name], ", "), strings.Join(p.Services, ", "))
+	return fmt.Sprintf("Preset: %s\nCategory: %s\nPackages (%s): %s\nServices: %s", p.Name, p.Category, pm.Name, strings.Join(p.Packages[pm.Name], ", "), strings.Join(serviceNames(p, pm.Name), ", "))
+}
+
+func serviceNames(p Preset, manager string) []string {
+	if services, ok := p.ServiceByPackage[manager]; ok {
+		return services
+	}
+	return p.Services
 }

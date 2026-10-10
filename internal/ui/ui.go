@@ -3,6 +3,11 @@ package ui
 import (
 	"bufio"
 	"fmt"
+	"io"
+	"regexp"
+
+	"github.com/mattn/go-runewidth"
+	"golang.org/x/term"
 	"os"
 	"strconv"
 	"strings"
@@ -56,20 +61,63 @@ func Error(msg string)    { fmt.Printf("%s %s\n", C(Red, "✗"), msg) }
 func Muted(msg string)    { fmt.Println(C(Gray, msg)) }
 
 func Box(title string, lines []string) {
-	width := len(title) + 4
-	for _, l := range lines {
-		if len(stripANSI(l))+4 > width {
-			width = len(stripANSI(l)) + 4
+	renderBox(os.Stdout, title, lines, terminalWidth())
+}
+
+func terminalWidth() int {
+	if width, _, err := term.GetSize(int(os.Stdout.Fd())); err == nil && width > 0 {
+		return width
+	}
+	if width, err := strconv.Atoi(os.Getenv("COLUMNS")); err == nil && width > 0 {
+		return width
+	}
+	return 80
+}
+
+func renderBox(w io.Writer, title string, lines []string, columns int) {
+	columns = max(8, columns)
+	width := max(50, displayWidth(title)+2)
+	for _, line := range lines {
+		for _, part := range strings.Split(line, "\n") {
+			width = max(width, displayWidth(part))
 		}
 	}
-	if width < 52 {
-		width = 52
+	width = min(width, columns-4)
+	title = runewidth.Truncate(stripANSI(title), width-2, "…")
+	fmt.Fprintln(w, C(Orange, "╭─ ")+C(Bold, title)+C(Orange, " "+strings.Repeat("─", width-displayWidth(title)-1)+"╮"))
+	for _, line := range lines {
+		for _, part := range strings.Split(line, "\n") {
+			part = strings.ReplaceAll(part, "\t", "    ")
+			if displayWidth(part) > width {
+				// Wrap plain text so an ANSI sequence cannot be split across lines.
+				part = runewidth.Wrap(stripANSI(part), width)
+			}
+			for _, row := range strings.Split(part, "\n") {
+				fmt.Fprintln(w, C(Orange, "│")+" "+row+strings.Repeat(" ", max(0, width-displayWidth(row)))+" "+C(Orange, "│"))
+			}
+		}
 	}
-	fmt.Println(C(Orange, "╭─ ") + C(Bold, title) + C(Orange, strings.Repeat("─", max(1, width-len(title)-4))+"╮"))
-	for _, l := range lines {
-		fmt.Printf("%s %-*s %s\n", C(Orange, "│"), width-2, l, C(Orange, "│"))
+	fmt.Fprintln(w, C(Orange, "╰"+strings.Repeat("─", width+2)+"╯"))
+}
+
+// Reuse the reader: creating one per prompt discards buffered answers from pipes.
+var inputFile *os.File
+var inputReader *bufio.Reader
+
+func Input() *bufio.Reader {
+	if inputReader == nil || inputFile != os.Stdin {
+		inputFile = os.Stdin
+		inputReader = bufio.NewReader(os.Stdin)
 	}
-	fmt.Println(C(Orange, "╰"+strings.Repeat("─", width)+"╯"))
+	return inputReader
+}
+
+func readLine() (string, error) {
+	line, err := Input().ReadString('\n')
+	if err == io.EOF && len(line) > 0 {
+		err = nil
+	}
+	return line, err
 }
 
 func Menu(title string, items []string) (int, error) {
@@ -78,8 +126,7 @@ func Menu(title string, items []string) (int, error) {
 		fmt.Printf("  %s %s\n", C(Orange, fmt.Sprintf("[%d]", i+1)), item)
 	}
 	fmt.Printf("\n%s ", C(Orange2, "Select:"))
-	r := bufio.NewReader(os.Stdin)
-	line, err := r.ReadString('\n')
+	line, err := readLine()
 	if err != nil {
 		return 0, err
 	}
@@ -96,8 +143,7 @@ func Prompt(label, def string) (string, error) {
 	} else {
 		fmt.Printf("%s %s: ", C(Orange2, "›"), label)
 	}
-	r := bufio.NewReader(os.Stdin)
-	line, err := r.ReadString('\n')
+	line, err := readLine()
 	if err != nil {
 		return "", err
 	}
@@ -114,8 +160,10 @@ func Confirm(label string, def bool) bool {
 		suffix = "[Y/n]"
 	}
 	fmt.Printf("%s %s %s: ", C(Orange2, "?"), label, suffix)
-	r := bufio.NewReader(os.Stdin)
-	line, _ := r.ReadString('\n')
+	line, err := readLine()
+	if err != nil {
+		return false
+	}
 	line = strings.ToLower(strings.TrimSpace(line))
 	if line == "" {
 		return def
@@ -134,12 +182,14 @@ func SelectMany(title string, items []string, defaultAll bool) ([]int, error) {
 	}
 	Muted("Enter comma-separated numbers, 'all', or press Enter to use the defaults.")
 	fmt.Printf("%s ", C(Orange2, "Select:"))
-	r := bufio.NewReader(os.Stdin)
-	line, err := r.ReadString('\n')
+	line, err := readLine()
 	if err != nil {
 		return nil, err
 	}
 	line = strings.TrimSpace(strings.ToLower(line))
+	if line == "" && !defaultAll {
+		return nil, nil
+	}
 	if line == "" && defaultAll {
 		out := make([]int, len(items))
 		for i := range items {
@@ -170,29 +220,11 @@ func SelectMany(title string, items []string, defaultAll bool) ([]int, error) {
 	return out, nil
 }
 
-func KeyValue(k, v string) string { return fmt.Sprintf("%-18s %s", C(Gray, k), v) }
+func KeyValue(k, v string) string {
+	return C(Gray, k) + strings.Repeat(" ", max(1, 19-displayWidth(k))) + v
+}
 
-func stripANSI(s string) string {
-	out := make([]rune, 0, len(s))
-	esc := false
-	for _, r := range s {
-		if r == '\x1b' {
-			esc = true
-			continue
-		}
-		if esc {
-			if r == 'm' {
-				esc = false
-			}
-			continue
-		}
-		out = append(out, r)
-	}
-	return string(out)
-}
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
+var ansiRx = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`)
+
+func stripANSI(s string) string { return ansiRx.ReplaceAllString(s, "") }
+func displayWidth(s string) int { return runewidth.StringWidth(stripANSI(s)) }

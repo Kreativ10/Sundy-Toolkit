@@ -1,6 +1,7 @@
 package snapshot
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -42,6 +43,7 @@ func (s Store) SaveSystem(name string, selected []int, automatic bool) (Meta, er
 		return m, err
 	}
 	d := s.SnapDir(m.ID)
+	var saveErrors []error
 	for _, i := range selected {
 		if i < 0 || i >= len(SystemComponents) {
 			continue
@@ -49,12 +51,13 @@ func (s Store) SaveSystem(name string, selected []int, automatic bool) (Meta, er
 		c := SystemComponents[i]
 		if err := saveComponent(d, c.Key); err != nil {
 			m.Notes += fmt.Sprintf("%s: %v; ", c.Key, err)
+			saveErrors = append(saveErrors, fmt.Errorf("%s: %w", c.Key, err))
 		}
 	}
 	if err := s.Update(m); err != nil {
 		return m, err
 	}
-	return m, nil
+	return m, errors.Join(saveErrors...)
 }
 
 func saveComponent(dir, key string) error {
@@ -78,11 +81,10 @@ func saveComponent(dir, key string) error {
 			return err
 		}
 		defer os.RemoveAll(tmp)
-		if b, e := os.ReadFile("/etc/ssh/sshd_config"); e == nil {
-			_ = os.WriteFile(filepath.Join(tmp, "sshd_config"), b, 0600)
-		}
-		if b, e := os.ReadFile("/etc/ssh/ssh_config"); e == nil {
-			_ = os.WriteFile(filepath.Join(tmp, "ssh_config"), b, 0600)
+		for _, file := range []string{"sshd_config", "ssh_config"} {
+			if err := copyOptionalFile(filepath.Join("/etc/ssh", file), filepath.Join(tmp, file)); err != nil {
+				return err
+			}
 		}
 		if e := copyDirFiltered("/etc/ssh/sshd_config.d", filepath.Join(tmp, "sshd_config.d")); e != nil && !os.IsNotExist(e) {
 			return e
@@ -98,25 +100,30 @@ func saveComponent(dir, key string) error {
 	case "docker":
 		return ArchivePaths(filepath.Join(dir, "component-docker.tar.gz"), []string{"/etc/docker"})
 	case "minecraft":
-		list, _ := apps.List()
+		list, err := apps.List()
+		if err != nil {
+			return err
+		}
 		tmp, err := os.MkdirTemp("", "sundy-minecraft-")
 		if err != nil {
 			return err
 		}
 		defer os.RemoveAll(tmp)
-		if b, e := os.ReadFile(filepath.Join(util.StateDir(), "apps.json")); e == nil {
-			_ = os.WriteFile(filepath.Join(tmp, "apps.json"), b, 0600)
+		if err := copyOptionalFile(filepath.Join(util.StateDir(), "apps.json"), filepath.Join(tmp, "apps.json")); err != nil {
+			return err
 		}
 		for _, a := range list {
 			if a.Kind != "minecraft" {
 				continue
 			}
-			inst := filepath.Join(tmp, a.Name)
-			_ = os.MkdirAll(inst, 0700)
+			inst := filepath.Join(tmp, "instance-"+filepath.Base(a.ID))
+			if err := os.MkdirAll(inst, 0700); err != nil {
+				return err
+			}
 			for _, f := range []string{"server.properties", "eula.txt", "bukkit.yml", "spigot.yml", "paper-global.yml", "paper-world-defaults.yml"} {
 				src := filepath.Join(a.Directory, f)
-				if b, e := os.ReadFile(src); e == nil {
-					_ = os.WriteFile(filepath.Join(inst, f), b, 0600)
+				if err := copyOptionalFile(src, filepath.Join(inst, f)); err != nil {
+					return err
 				}
 			}
 		}
@@ -145,46 +152,46 @@ func (s Store) RestoreSystem(idOrName string, keys []string, apply bool) error {
 	if len(keys) == 0 {
 		return fmt.Errorf("select at least one component to restore")
 	}
-	// Take a broad emergency snapshot before any restoration.
-	all := make([]int, len(SystemComponents))
-	for i := range all {
-		all[i] = i
+	// Validate every component before taking a backup or changing files.
+	var selected []int
+	for _, key := range keys {
+		index := -1
+		for i, c := range SystemComponents {
+			if c.Key == key {
+				index = i
+				break
+			}
+		}
+		if index < 0 {
+			return fmt.Errorf("unknown component %q", key)
+		}
+		if key == "ssh" || key == "minecraft" || key == "packages" {
+			return fmt.Errorf("component %s is review-only; restore its configuration manually from the snapshot", key)
+		}
+		if _, err := os.Stat(filepath.Join(s.SnapDir(m.ID), "component-"+key+".tar.gz")); err != nil {
+			return fmt.Errorf("component %s is not present in snapshot", key)
+		}
+		selected = append(selected, index)
 	}
-	_, _ = s.SaveSystem("auto-before-restore-"+m.Name, all, true)
+	rollback, err := s.SaveSystem("auto-before-restore-"+m.Name, selected, true)
+	if err != nil {
+		return fmt.Errorf("could not create emergency rollback snapshot: %w", err)
+	}
 	for _, key := range keys {
 		archive := filepath.Join(s.SnapDir(m.ID), "component-"+key+".tar.gz")
 		if _, err := os.Stat(archive); err != nil {
 			return fmt.Errorf("component %s is not present in snapshot", key)
 		}
-		if key == "ssh" {
-			if err := restoreSSHArchive(archive); err != nil {
-				return err
-			}
-			continue
-		}
-		if key == "minecraft" {
-			return fmt.Errorf("Minecraft component is intentionally review-only in v0.1; restore server configuration manually from the snapshot bundle")
-		}
 		if err := ExtractArchive(archive); err != nil {
-			return fmt.Errorf("restore %s: %w", key, err)
+			rollbackErr := ExtractArchive(filepath.Join(s.SnapDir(rollback.ID), "component-"+key+".tar.gz"))
+			return errors.Join(fmt.Errorf("restore %s failed; rollback attempted: %w", key, err), rollbackErr)
 		}
 		if err := verifyRestored(key); err != nil {
-			return fmt.Errorf("%s restored but validation failed: %w", key, err)
+			rollbackErr := ExtractArchive(filepath.Join(s.SnapDir(rollback.ID), "component-"+key+".tar.gz"))
+			return errors.Join(fmt.Errorf("%s validation failed; rollback attempted: %w", key, err), rollbackErr)
 		}
 	}
 	return nil
-}
-
-func restoreSSHArchive(archive string) error {
-	tmp, err := os.MkdirTemp("", "sundy-ssh-restore-")
-	if err != nil {
-		return err
-	}
-	defer os.RemoveAll(tmp)
-	// Generic ExtractArchive restores absolute paths, while SSH snapshots intentionally use a temp root.
-	// For v0.1, keep SSH recovery safe by not automatically overwriting daemon config.
-	_ = archive
-	return fmt.Errorf("SSH automatic restore is disabled to avoid locking out remote sessions; inspect the snapshot and restore explicitly")
 }
 
 func verifyRestored(key string) error {
@@ -234,10 +241,19 @@ func copyDirFiltered(src, dst string) error {
 		if strings.Contains(name, "ssh_host_") && strings.HasSuffix(name, "_key") {
 			continue
 		}
-		b, er := os.ReadFile(filepath.Join(src, name))
-		if er == nil {
-			_ = os.WriteFile(filepath.Join(dst, name), b, 0600)
+		if err := copyOptionalFile(filepath.Join(src, name), filepath.Join(dst, name)); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+func copyOptionalFile(src, dst string) error {
+	if _, err := os.Stat(src); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	return util.CopyFile(src, dst, 0600)
 }

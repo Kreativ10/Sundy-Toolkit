@@ -2,8 +2,10 @@ package apps
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
+	"syscall"
 	"time"
 
 	"github.com/SundySystems/sundy-toolkit/internal/util"
@@ -39,21 +41,35 @@ func List() ([]App, error) {
 	return r.Apps, nil
 }
 func Save(a App) error {
+	return update(func(list []App) []App {
+		for i := range list {
+			if list[i].ID == a.ID {
+				list[i] = a
+				return list
+			}
+		}
+		return append(list, a)
+	})
+}
+
+func update(change func([]App) []App) error {
+	if err := os.MkdirAll(filepath.Dir(path()), 0700); err != nil {
+		return err
+	}
+	lock, err := os.OpenFile(path()+".lock", os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		return err
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
 	list, err := List()
 	if err != nil {
 		return err
 	}
-	found := false
-	for i := range list {
-		if list[i].ID == a.ID {
-			list[i] = a
-			found = true
-		}
-	}
-	if !found {
-		list = append(list, a)
-	}
-	return util.WriteJSON(path(), registry{list}, 0600)
+	return util.WriteJSON(path(), registry{change(list)}, 0600)
 }
 func Get(id string) (App, error) {
 	list, err := List()
@@ -68,15 +84,13 @@ func Get(id string) (App, error) {
 	return App{}, fmt.Errorf("app %q not found", id)
 }
 func Delete(id string) error {
-	list, err := List()
-	if err != nil {
-		return err
-	}
-	out := list[:0]
-	for _, a := range list {
-		if a.ID != id && a.Name != id {
-			out = append(out, a)
+	return update(func(list []App) []App {
+		out := list[:0]
+		for _, a := range list {
+			if a.ID != id && a.Name != id {
+				out = append(out, a)
+			}
 		}
-	}
-	return util.WriteJSON(path(), registry{out}, 0600)
+		return out
+	})
 }

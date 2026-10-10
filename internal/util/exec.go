@@ -31,6 +31,9 @@ func Run(timeout time.Duration, name string, args ...string) Result {
 			code = ee.ExitCode()
 		} else {
 			code = 127
+			if errb.Len() == 0 {
+				errb.WriteString(err.Error())
+			}
 		}
 	}
 	if ctx.Err() == context.DeadlineExceeded {

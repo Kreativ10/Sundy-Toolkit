@@ -1,21 +1,12 @@
 package minecraft
 
 import (
-	"bufio"
-	"context"
-	"crypto/sha1"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net"
-	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/SundySystems/sundy-toolkit/internal/apps"
@@ -24,392 +15,215 @@ import (
 )
 
 type Config struct {
-	Name, Directory, Jar, Memory string
-	Port                         int
-	AcceptEULA                   bool
-	AutoStart                    bool
-	Restart                      bool
+	Name, Directory, Jar, Memory   string
+	Java                           string
+	Port                           int
+	AcceptEULA, AutoStart, Restart bool
+	javaMajor                      int
+	version                        string
 }
 
-func InstallExisting(c Config) (apps.App, error) {
-	if err := util.RequireRoot(); err != nil {
-		return apps.App{}, err
+var nameRx = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$`)
+var memoryRx = regexp.MustCompile(`(?i)^[1-9][0-9]*[MG]$`)
+
+func normalizeConfig(c Config) (Config, error) {
+	if !nameRx.MatchString(c.Name) {
+		return c, fmt.Errorf("instance name must contain 1-48 letters, digits, underscores or hyphens and start with a letter or digit")
 	}
-	if c.Name == "" || c.Directory == "" {
-		return apps.App{}, fmt.Errorf("name and directory are required")
+	if strings.TrimSpace(c.Directory) == "" {
+		return c, fmt.Errorf("server directory is required")
+	}
+	for _, value := range []string{c.Directory, c.Jar, c.Java} {
+		if strings.ContainsAny(value, "\x00\r\n") {
+			return c, fmt.Errorf("paths must not contain control characters")
+		}
 	}
 	if c.Port < 1 || c.Port > 65535 {
-		return apps.App{}, fmt.Errorf("invalid port")
-	}
-	abs, err := filepath.Abs(c.Directory)
-	if err != nil {
-		return apps.App{}, err
-	}
-	c.Directory = abs
-	st, err := os.Stat(abs)
-	if err != nil || !st.IsDir() {
-		return apps.App{}, fmt.Errorf("server directory does not exist: %s", abs)
-	}
-	if c.Jar == "" {
-		c.Jar = findJar(abs)
-	}
-	if c.Jar == "" {
-		return apps.App{}, fmt.Errorf("no server jar found; specify --jar")
-	}
-	if !filepath.IsAbs(c.Jar) {
-		c.Jar = filepath.Join(abs, c.Jar)
-	}
-	if _, err := os.Stat(c.Jar); err != nil {
-		return apps.App{}, fmt.Errorf("server jar not found: %s", c.Jar)
-	}
-	if !util.Exists("java") {
-		if err := installJava(); err != nil {
-			return apps.App{}, err
-		}
-	}
-	if err := setProperty(filepath.Join(abs, "server.properties"), "server-port", strconv.Itoa(c.Port)); err != nil {
-		return apps.App{}, err
-	}
-	if c.AcceptEULA {
-		if err := setProperty(filepath.Join(abs, "eula.txt"), "eula", "true"); err != nil {
-			return apps.App{}, err
-		}
+		return c, fmt.Errorf("port must be between 1 and 65535")
 	}
 	if c.Memory == "" {
 		c.Memory = "2G"
 	}
-	a := apps.App{ID: "minecraft-" + safe(c.Name), Kind: "minecraft", Name: c.Name, Directory: abs, Port: c.Port, Service: serviceName(c.Name), InstalledAt: time.Now(), Metadata: map[string]string{"jar": c.Jar, "memory": c.Memory, "restart": strconv.FormatBool(c.Restart)}}
+	c.Memory = strings.ToUpper(c.Memory)
+	if !memoryRx.MatchString(c.Memory) {
+		return c, fmt.Errorf("memory must be a positive integer followed by M or G, for example 2048M or 2G")
+	}
+	amount, err := strconv.ParseUint(c.Memory[:len(c.Memory)-1], 10, 32)
+	if err != nil || (strings.HasSuffix(c.Memory, "M") && amount < 64) {
+		return c, fmt.Errorf("invalid Java heap size %q (minimum 64M)", c.Memory)
+	}
+	c.Directory, err = filepath.Abs(c.Directory)
+	if err != nil {
+		return c, err
+	}
+	if c.Jar != "" && !filepath.IsAbs(c.Jar) {
+		c.Jar = filepath.Join(c.Directory, c.Jar)
+	}
+	return c, nil
+}
+
+func checkAvailable(c Config) error {
+	list, err := apps.List()
+	if err != nil {
+		return err
+	}
+	for _, a := range list {
+		if a.ID == "minecraft-"+c.Name || a.Name == c.Name {
+			return fmt.Errorf("instance %q already exists; use minecraft start/restart/status to manage it", c.Name)
+		}
+		if a.Kind == "minecraft" && (a.Directory == c.Directory || a.Port == c.Port) {
+			return fmt.Errorf("directory or port is already registered to %s", a.Name)
+		}
+	}
+	return nil
+}
+
+func InstallExisting(c Config) (apps.App, error) {
+	var err error
+	c, err = normalizeConfig(c)
+	if err != nil {
+		return apps.App{}, err
+	}
+	if err := util.RequireRoot(); err != nil {
+		return apps.App{}, err
+	}
+	if err := checkAvailable(c); err != nil {
+		return apps.App{}, err
+	}
+	init := platform.Detect().Init
+	if init != "systemd" && init != "openrc" {
+		return apps.App{}, fmt.Errorf("Minecraft service installation requires systemd or OpenRC")
+	}
+	st, err := os.Stat(c.Directory)
+	if err != nil || !st.IsDir() {
+		return apps.App{}, fmt.Errorf("server directory does not exist: %s", c.Directory)
+	}
+	if c.Jar == "" {
+		c.Jar = findJar(c.Directory)
+	}
+	if c.Jar == "" {
+		return apps.App{}, fmt.Errorf("no unambiguous server jar found; specify its filename")
+	}
+	st, err = os.Stat(c.Jar)
+	if err != nil || !st.Mode().IsRegular() {
+		return apps.App{}, fmt.Errorf("server jar is not a regular file: %s", c.Jar)
+	}
+	if c.javaMajor == 0 {
+		c.javaMajor, err = jarJavaMajor(c.Jar)
+		if err != nil {
+			return apps.App{}, err
+		}
+	}
+	java, err := ensureJava(c.Java, c.javaMajor)
+	if err != nil {
+		return apps.App{}, err
+	}
+	if !c.AcceptEULA {
+		b, err := os.ReadFile(filepath.Join(c.Directory, "eula.txt"))
+		if err != nil || !propertyEquals(string(b), "eula", "true") {
+			return apps.App{}, fmt.Errorf("Minecraft EULA must be explicitly accepted before starting a server")
+		}
+	}
+	if err := setProperty(filepath.Join(c.Directory, "server.properties"), "server-port", strconv.Itoa(c.Port)); err != nil {
+		return apps.App{}, err
+	}
+	if c.AcceptEULA {
+		if err := setProperty(filepath.Join(c.Directory, "eula.txt"), "eula", "true"); err != nil {
+			return apps.App{}, err
+		}
+	}
+	a := apps.App{ID: "minecraft-" + c.Name, Kind: "minecraft", Name: c.Name, Directory: c.Directory, Port: c.Port, Service: serviceName(c.Name), Version: c.version, InstalledAt: time.Now(), Metadata: map[string]string{"jar": c.Jar, "java": java, "java_major": strconv.Itoa(c.javaMajor), "memory": c.Memory, "restart": strconv.FormatBool(c.Restart)}}
 	if err := apps.Save(a); err != nil {
 		return a, err
 	}
 	if err := installService(a, c.AutoStart, c.Restart); err != nil {
-		return a, err
+		return a, fmt.Errorf("instance %s was saved, but service setup failed: %w; inspect with sudo sundy minecraft status %s", a.Name, err, a.Name)
 	}
 	return a, nil
 }
 
 func CreateVanilla(c Config, version string) (apps.App, error) {
+	var err error
+	c, err = normalizeConfig(c)
+	if err != nil {
+		return apps.App{}, err
+	}
 	if err := util.RequireRoot(); err != nil {
+		return apps.App{}, err
+	}
+	if err := checkAvailable(c); err != nil {
+		return apps.App{}, err
+	}
+	if init := platform.Detect().Init; init != "systemd" && init != "openrc" {
+		return apps.App{}, fmt.Errorf("Minecraft service installation requires systemd or OpenRC")
+	}
+	if !c.AcceptEULA {
+		return apps.App{}, fmt.Errorf("Minecraft EULA must be explicitly accepted")
+	}
+	entries, err := os.ReadDir(c.Directory)
+	if err != nil && !os.IsNotExist(err) {
+		return apps.App{}, err
+	}
+	if len(entries) > 0 {
+		return apps.App{}, fmt.Errorf("new server directory must be empty; register an existing server instead")
+	}
+	meta, err := resolveVanilla(&httpClient, version)
+	if err != nil {
+		return apps.App{}, err
+	}
+	c.Java, err = ensureJava(c.Java, meta.JavaVersion.MajorVersion)
+	if err != nil {
 		return apps.App{}, err
 	}
 	if err := os.MkdirAll(c.Directory, 0755); err != nil {
 		return apps.App{}, err
 	}
-	jar := filepath.Join(c.Directory, "server.jar")
-	resolved, err := DownloadVanilla(version, jar)
-	if err != nil {
+	c.Jar = filepath.Join(c.Directory, "server.jar")
+	if err := downloadServer(&httpClient, meta, c.Jar); err != nil {
 		return apps.App{}, err
 	}
-	c.Jar = jar
-	a, err := InstallExisting(c)
-	if err == nil {
-		a.Version = resolved
-		_ = apps.Save(a)
-	}
-	return a, err
+	c.version, c.javaMajor = meta.ID, meta.JavaVersion.MajorVersion
+	return InstallExisting(c)
 }
 
-func DownloadVanilla(version, dst string) (string, error) {
-	client := &http.Client{Timeout: 45 * time.Second}
-	var manifest struct {
-		Latest struct {
-			Release string `json:"release"`
-		} `json:"latest"`
-		Versions []struct{ ID, URL string }
-	}
-	if err := getJSON(client, "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json", &manifest); err != nil {
-		return "", err
-	}
-	if version == "" || version == "latest" {
-		version = manifest.Latest.Release
-	}
-	var vurl string
-	for _, v := range manifest.Versions {
-		if v.ID == version {
-			vurl = v.URL
-			break
+func propertyEquals(text, key, value string) bool {
+	for _, line := range strings.Split(text, "\n") {
+		parts := strings.SplitN(strings.TrimSpace(line), "=", 2)
+		if len(parts) == 2 && strings.TrimSpace(parts[0]) == key && strings.TrimSpace(parts[1]) == value {
+			return true
 		}
 	}
-	if vurl == "" {
-		return "", fmt.Errorf("Minecraft version %s not found", version)
-	}
-	var meta struct {
-		Downloads struct {
-			Server struct {
-				URL, SHA1 string
-				Size      int64
-			} `json:"server"`
-		} `json:"downloads"`
-	}
-	if err := getJSON(client, vurl, &meta); err != nil {
-		return "", err
-	}
-	if meta.Downloads.Server.URL == "" {
-		return "", fmt.Errorf("server download is unavailable for %s", version)
-	}
-	resp, err := client.Get(meta.Downloads.Server.URL)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode/100 != 2 {
-		return "", fmt.Errorf("download returned %s", resp.Status)
-	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
-		return "", err
-	}
-	tmp := dst + ".part"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return "", err
-	}
-	h := sha1.New()
-	_, cp := io.Copy(io.MultiWriter(f, h), resp.Body)
-	ce := f.Close()
-	if cp != nil {
-		return "", cp
-	}
-	if ce != nil {
-		return "", ce
-	}
-	if want := strings.ToLower(meta.Downloads.Server.SHA1); want != "" && hex.EncodeToString(h.Sum(nil)) != want {
-		_ = os.Remove(tmp)
-		return "", fmt.Errorf("download checksum mismatch")
-	}
-	if err := os.Rename(tmp, dst); err != nil {
-		return "", err
-	}
-	return version, nil
-}
-func getJSON(c *http.Client, url string, v any) error {
-	r, e := c.Get(url)
-	if e != nil {
-		return e
-	}
-	defer r.Body.Close()
-	if r.StatusCode/100 != 2 {
-		return fmt.Errorf("%s returned %s", url, r.Status)
-	}
-	return json.NewDecoder(r.Body).Decode(v)
+	return false
 }
 
-func RunSupervisor(name string) error {
-	a, err := apps.Get(name)
-	if err != nil {
-		return err
-	}
-	if a.Kind != "minecraft" {
-		return fmt.Errorf("%s is not a Minecraft app", name)
-	}
-	jar := a.Metadata["jar"]
-	mem := a.Metadata["memory"]
-	if mem == "" {
-		mem = "2G"
-	}
-	runDir := "/run/sundy/minecraft"
-	if err := os.MkdirAll(runDir, 0755); err != nil {
-		return err
-	}
-	sock := filepath.Join(runDir, safe(a.Name)+".sock")
-	_ = os.Remove(sock)
-	ln, err := net.Listen("unix", sock)
-	if err != nil {
-		return err
-	}
-	defer func() { ln.Close(); os.Remove(sock) }()
-	_ = os.Chmod(sock, 0660)
-	logDir := filepath.Join(util.StateDir(), "minecraft", safe(a.Name))
-	_ = os.MkdirAll(logDir, 0750)
-	log, err := os.OpenFile(filepath.Join(logDir, "console.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0640)
-	if err != nil {
-		return err
-	}
-	defer log.Close()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "java", "-Xms"+mem, "-Xmx"+mem, "-jar", jar, "nogui")
-	cmd.Dir = a.Directory
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return err
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return err
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return err
-	}
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-	clients := map[net.Conn]bool{}
-	var mu sync.Mutex
-	broadcast := func(line string) {
-		log.WriteString(line)
-		log.Sync()
-		mu.Lock()
-		defer mu.Unlock()
-		for c := range clients {
-			if _, e := io.WriteString(c, line); e != nil {
-				c.Close()
-				delete(clients, c)
-			}
-		}
-	}
-	pump := func(r io.Reader) {
-		s := bufio.NewScanner(r)
-		buf := make([]byte, 64*1024)
-		s.Buffer(buf, 1024*1024)
-		for s.Scan() {
-			broadcast(s.Text() + "\n")
-		}
-	}
-	go pump(stdout)
-	go pump(stderr)
-	go func() {
-		for {
-			c, e := ln.Accept()
-			if e != nil {
-				return
-			}
-			mu.Lock()
-			clients[c] = true
-			mu.Unlock()
-			go func(conn net.Conn) {
-				defer func() { mu.Lock(); delete(clients, conn); mu.Unlock(); conn.Close() }()
-				sc := bufio.NewScanner(conn)
-				for sc.Scan() {
-					line := sc.Text()
-					if line == ":detach" {
-						return
-					}
-					io.WriteString(stdin, line+"\n")
-				}
-			}(c)
-		}
-	}()
-	err = cmd.Wait()
-	ln.Close()
-	return err
-}
-
-func Console(name string) error {
-	a, err := apps.Get(name)
-	if err != nil {
-		return err
-	}
-	sock := filepath.Join("/run/sundy/minecraft", safe(a.Name)+".sock")
-	c, err := net.Dial("unix", sock)
-	if err != nil {
-		return fmt.Errorf("server console is unavailable (%v); is %s running?", err, a.Service)
-	}
-	defer c.Close()
-	done := make(chan struct{})
-	go func() { io.Copy(os.Stdout, c); close(done) }()
-	fmt.Println("Connected. Type :detach to leave without stopping the server.")
-	sc := bufio.NewScanner(os.Stdin)
-	for sc.Scan() {
-		line := sc.Text()
-		fmt.Fprintln(c, line)
-		if line == ":detach" {
-			return nil
-		}
-	}
-	return nil
-}
-
-func installService(a apps.App, autostart, restart bool) error {
-	p := platform.Detect()
-	exe, err := os.Executable()
-	if err != nil {
-		return err
-	}
-	if real, e := filepath.EvalSymlinks(exe); e == nil {
-		exe = real
-	}
-	switch p.Init {
-	case "systemd":
-		policy := "no"
-		if restart {
-			policy = "on-failure"
-		}
-		unit := fmt.Sprintf(`[Unit]
-Description=Sundy Minecraft - %s
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=%s
-ExecStart=%s runtime minecraft %s
-Restart=%s
-RestartSec=5
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
-`, a.Name, a.Directory, exe, a.Name, policy)
-		path := filepath.Join("/etc/systemd/system", a.Service+".service")
-		if err := os.WriteFile(path, []byte(unit), 0644); err != nil {
-			return err
-		}
-		if r := util.Run(10*time.Second, "systemctl", "daemon-reload"); r.Code != 0 {
-			return fmt.Errorf("systemctl daemon-reload: %s", r.Stderr)
-		}
-		if autostart {
-			if r := util.Run(10*time.Second, "systemctl", "enable", "--now", a.Service); r.Code != 0 {
-				return fmt.Errorf("enable service: %s", r.Stderr)
-			}
-		}
-	case "openrc":
-		script := fmt.Sprintf("#!/sbin/openrc-run\nname=\"Sundy Minecraft %s\"\ncommand=\"%s\"\ncommand_args=\"runtime minecraft %s\"\ncommand_background=false\ndirectory=\"%s\"\ndepend() { need net; }\n", a.Name, exe, a.Name, a.Directory)
-		path := filepath.Join("/etc/init.d", a.Service)
-		if err := os.WriteFile(path, []byte(script), 0755); err != nil {
-			return err
-		}
-		if autostart {
-			_ = util.RunStreaming("rc-update", "add", a.Service, "default")
-			_ = util.RunStreaming("rc-service", a.Service, "start")
-		}
-	default:
-		return fmt.Errorf("automatic service installation currently requires systemd or OpenRC; app definition was saved")
-	}
-	return nil
-}
-func installJava() error {
-	p := platform.Detect()
-	pkg := "openjdk-21-jre-headless"
-	switch p.Package {
-	case "dnf", "yum":
-		pkg = "java-21-openjdk-headless"
-	case "pacman":
-		pkg = "jre21-openjdk-headless"
-	case "apk":
-		pkg = "openjdk21-jre-headless"
-	case "zypper":
-		pkg = "java-21-openjdk-headless"
-	}
-	return platform.Packages().Install(pkg)
-}
 func findJar(dir string) string {
 	for _, n := range []string{"server.jar", "paper.jar", "purpur.jar", "fabric-server-launch.jar", "forge.jar"} {
-		if _, e := os.Stat(filepath.Join(dir, n)); e == nil {
+		if st, e := os.Stat(filepath.Join(dir, n)); e == nil && st.Mode().IsRegular() {
 			return filepath.Join(dir, n)
 		}
 	}
 	ents, _ := os.ReadDir(dir)
+	var candidates []string
 	for _, e := range ents {
 		if !e.IsDir() && strings.HasSuffix(strings.ToLower(e.Name()), ".jar") {
-			return filepath.Join(dir, e.Name())
+			candidates = append(candidates, filepath.Join(dir, e.Name()))
 		}
+	}
+	if len(candidates) == 1 {
+		return candidates[0]
 	}
 	return ""
 }
 func setProperty(path, key, val string) error {
+	mode := os.FileMode(0644)
+	if st, err := os.Stat(path); err == nil {
+		mode = st.Mode().Perm()
+	}
 	var lines []string
 	if b, e := os.ReadFile(path); e == nil {
 		lines = strings.Split(strings.ReplaceAll(string(b), "\r\n", "\n"), "\n")
+	} else if !os.IsNotExist(e) {
+		return e
 	}
 	found := false
 	for i, l := range lines {
@@ -426,10 +240,6 @@ func setProperty(path, key, val string) error {
 	if !found {
 		lines = append(lines, key+"="+val)
 	}
-	return os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0644)
+	return util.AtomicWrite(path, []byte(strings.TrimRight(strings.Join(lines, "\n"), "\n")+"\n"), mode)
 }
-func safe(s string) string {
-	r := strings.NewReplacer("/", "-", " ", "-", "..", "-")
-	return r.Replace(s)
-}
-func serviceName(name string) string { return "sundy-minecraft-" + safe(name) }
+func serviceName(name string) string { return "sundy-minecraft-" + name }

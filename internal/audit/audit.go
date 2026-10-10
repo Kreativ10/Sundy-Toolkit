@@ -126,7 +126,7 @@ func checkServices() []Finding {
 	if platform.Detect().Init != "systemd" || !util.Exists("systemctl") {
 		return nil
 	}
-	r := util.Run(8*time.Second, "systemctl", "--failed", "--no-legend", "--plain")
+	r := util.Run(8*time.Second, "systemctl", "--failed", "--type=service", "--no-legend", "--plain")
 	if r.Code != 0 && r.Stdout == "" {
 		return nil
 	}

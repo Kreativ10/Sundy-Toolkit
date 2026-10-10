@@ -2,6 +2,7 @@ package audit
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/SundySystems/sundy-toolkit/internal/util"
@@ -22,6 +23,22 @@ func Repair(f Finding) RepairResult {
 	}
 	switch f.RepairAction {
 	case "systemd-reset-restart":
+		if f.Target == "" || strings.HasPrefix(f.Target, "-") || !strings.HasSuffix(f.Target, ".service") {
+			return RepairResult{f.ID, false, "repair target must be a service unit"}
+		}
+		var check []string
+		if strings.HasPrefix(f.Target, "nginx.") {
+			check = []string{"nginx", "-t"}
+		}
+		if f.Target == "ssh.service" || f.Target == "sshd.service" {
+			check = []string{"sshd", "-t"}
+		}
+		if len(check) > 0 && util.Exists(check[0]) {
+			r := util.Run(8*time.Second, check[0], check[1:]...)
+			if r.Code != 0 {
+				return RepairResult{f.ID, false, "configuration validation failed: " + nonempty(r.Stderr, r.Stdout)}
+			}
+		}
 		reset := util.Run(8*time.Second, "systemctl", "reset-failed", f.Target)
 		if reset.Code != 0 {
 			return RepairResult{f.ID, false, "reset-failed failed: " + reset.Stderr}

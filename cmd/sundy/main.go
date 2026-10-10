@@ -1,10 +1,10 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -107,7 +107,7 @@ Usage:
   sundy minecraft console NAME
   sundy service ACTION NAME   status/start/stop/restart/enable/disable
   sundy report [--anonymous]  Create support bundle
-  sundy update                Update from signed release checksums
+  sundy update                Update using release SHA-256 checksums
 
 `, version)
 }
@@ -122,27 +122,31 @@ func tui() {
 			ui.Error(err.Error())
 			return
 		}
+		var actionErr error
 		switch n {
 		case 0:
-			_ = cmdOverview(nil)
+			actionErr = cmdOverview(nil)
 		case 1:
-			_ = cmdAudit([]string{"--full", "--fix"})
+			actionErr = cmdAudit([]string{"--full", "--fix"})
 		case 2:
-			_ = networkMenu()
+			actionErr = networkMenu()
 		case 3:
-			_ = snapshotMenu()
+			actionErr = snapshotMenu()
 		case 4:
-			_ = cmdInstall(nil)
+			actionErr = cmdInstall(nil)
 		case 5:
-			_ = cmdApps(nil)
+			actionErr = cmdApps(nil)
 		case 6:
-			_ = minecraftMenu()
+			actionErr = minecraftMenu()
 		case 7:
-			_ = servicesMenu()
+			actionErr = servicesMenu()
 		case 8:
-			_ = cmdReport(nil)
+			actionErr = cmdReport(nil)
 		case 9:
 			return
+		}
+		if actionErr != nil {
+			ui.Error(actionErr.Error())
 		}
 		fmt.Println()
 	}
@@ -241,6 +245,7 @@ func interactiveRepair(findings []audit.Finding) error {
 	if !ui.Confirm("Apply selected controlled repairs?", false) {
 		return nil
 	}
+	var failures []error
 	for _, i := range sel {
 		f := repairable[i]
 		ui.Info("Repairing " + f.Title)
@@ -249,9 +254,10 @@ func interactiveRepair(findings []audit.Finding) error {
 			ui.Success(rr.Message)
 		} else {
 			ui.Error(rr.Message)
+			failures = append(failures, errors.New(rr.Message))
 		}
 	}
-	return nil
+	return errors.Join(failures...)
 }
 
 func cmdDoctor(args []string) error {
@@ -398,18 +404,20 @@ func cmdSnapshot(args []string) error {
 		if len(args) < 2 {
 			return fmt.Errorf("usage: sundy snapshot restore NAME --components network,firewall --apply")
 		}
-		var keys []string
-		apply := false
-		for i := 2; i < len(args); i++ {
-			if args[i] == "--apply" {
-				apply = true
-			}
-			if args[i] == "--components" && i+1 < len(args) {
-				keys = strings.Split(args[i+1], ",")
-				i++
-			}
+		fs := flag.NewFlagSet("snapshot restore", flag.ContinueOnError)
+		components := fs.String("components", "", "comma-separated components")
+		apply := fs.Bool("apply", false, "apply restored configuration")
+		if err := fs.Parse(args[2:]); err != nil {
+			return err
 		}
-		return snapshot.NewStore().RestoreSystem(args[1], keys, apply)
+		if fs.NArg() > 0 {
+			return fmt.Errorf("unexpected restore arguments")
+		}
+		var keys []string
+		if *components != "" {
+			keys = strings.Split(*components, ",")
+		}
+		return snapshot.NewStore().RestoreSystem(args[1], keys, *apply)
 	default:
 		return fmt.Errorf("usage: sundy snapshot <show|create|restore>")
 	}
@@ -526,6 +534,9 @@ func installMenu() error {
 }
 
 func installMinecraftInteractive() error {
+	if err := util.RequireRoot(); err != nil {
+		return err
+	}
 	mode, err := ui.Menu("Minecraft Setup", []string{"Direct / console managed", "Pterodactyl Panel workflow", "Back"})
 	if err != nil {
 		return err
@@ -540,32 +551,57 @@ func installMinecraftInteractive() error {
 	if err != nil {
 		return err
 	}
-	name, _ := ui.Prompt("Instance name", "survival")
-	dir, _ := ui.Prompt("Server directory", "/srv/minecraft/"+name)
-	portS, _ := ui.Prompt("Server port", "25565")
-	port, _ := strconv.Atoi(portS)
-	mem, _ := ui.Prompt("Java memory", "4G")
+	name, err := ui.Prompt("Instance name", "survival")
+	if err != nil {
+		return err
+	}
+	dir, err := ui.Prompt("Server directory", "/srv/minecraft/"+name)
+	if err != nil {
+		return err
+	}
+	portS, err := ui.Prompt("Server port", "25565")
+	if err != nil {
+		return err
+	}
+	port, err := strconv.Atoi(portS)
+	if err != nil {
+		return fmt.Errorf("invalid server port %q", portS)
+	}
+	mem, err := ui.Prompt("Maximum Java heap (leave RAM for the OS and native allocations)", "2G")
+	if err != nil {
+		return err
+	}
+	java, err := ui.Prompt("Java executable", "java")
+	if err != nil {
+		return err
+	}
 	auto := ui.Confirm("Start now and enable autostart?", true)
 	restart := ui.Confirm("Restart automatically after crashes?", true)
-	eula := ui.Confirm("Accept the Minecraft EULA for this server?", false)
+	eula := ui.Confirm("Accept the Minecraft EULA (https://aka.ms/MinecraftEULA)?", false)
 	if !eula {
 		return fmt.Errorf("Minecraft server installation stopped because the EULA was not accepted")
 	}
-	cfg := minecraft.Config{Name: name, Directory: dir, Port: port, Memory: mem, AcceptEULA: true, AutoStart: auto, Restart: restart}
+	cfg := minecraft.Config{Name: name, Directory: dir, Port: port, Memory: mem, Java: java, AcceptEULA: true, AutoStart: auto, Restart: restart}
 	var a apps.App
 	if src == 0 {
-		jar, _ := ui.Prompt("Server JAR (blank = auto-detect)", "")
+		jar, err := ui.Prompt("Server JAR (blank = auto-detect)", "")
+		if err != nil {
+			return err
+		}
 		cfg.Jar = jar
 		a, err = minecraft.InstallExisting(cfg)
 	} else {
-		ver, _ := ui.Prompt("Minecraft version", "latest")
+		ver, err := ui.Prompt("Minecraft version", "latest")
+		if err != nil {
+			return err
+		}
 		a, err = minecraft.CreateVanilla(cfg, ver)
 	}
 	if err != nil {
 		return err
 	}
 	ui.Success(fmt.Sprintf("Minecraft instance %s registered on port %d", a.Name, a.Port))
-	fmt.Printf("Console: %s\n", ui.C(ui.Orange, "sundy minecraft console "+a.Name))
+	fmt.Printf("Console: %s\n", ui.C(ui.Orange, "sudo sundy minecraft console "+a.Name))
 	return nil
 }
 
@@ -578,8 +614,14 @@ func installPterodactylInteractive() error {
 		return nil
 	}
 	if mode == 0 || mode == 2 {
-		domain, _ := ui.Prompt("Panel domain", "panel.example.com")
-		email, _ := ui.Prompt("Administrator/contact email", "admin@example.com")
+		domain, err := ui.Prompt("Panel domain", "panel.example.com")
+		if err != nil {
+			return err
+		}
+		email, err := ui.Prompt("Administrator/contact email", "admin@example.com")
+		if err != nil {
+			return err
+		}
 		ui.Warn("The stable native Panel preset changes packages, MariaDB, Redis, NGINX, cron and systemd services.")
 		if !ui.Confirm("Continue with Panel installation?", false) {
 			return nil
@@ -605,6 +647,9 @@ func installPterodactylInteractive() error {
 }
 
 func cmdApps(args []string) error {
+	if err := util.RequireRoot(); err != nil {
+		return err
+	}
 	list, err := apps.List()
 	if err != nil {
 		return err
@@ -636,12 +681,18 @@ func cmdMinecraft(args []string) error {
 		return fmt.Errorf("usage: sundy minecraft <console|start|stop|restart|status> NAME")
 	}
 	name := args[1]
+	if err := util.RequireRoot(); err != nil {
+		return err
+	}
 	if action == "console" {
 		return minecraft.Console(name)
 	}
 	a, err := apps.Get(name)
 	if err != nil {
 		return err
+	}
+	if a.Kind != "minecraft" || a.Service == "" {
+		return fmt.Errorf("%q is not a managed Minecraft instance", name)
 	}
 	switch action {
 	case "start", "stop", "restart", "status":
@@ -651,7 +702,13 @@ func cmdMinecraft(args []string) error {
 	}
 }
 func minecraftMenu() error {
-	list, _ := apps.List()
+	if err := util.RequireRoot(); err != nil {
+		return err
+	}
+	list, err := apps.List()
+	if err != nil {
+		return err
+	}
 	var mc []apps.App
 	for _, a := range list {
 		if a.Kind == "minecraft" {
@@ -723,6 +780,12 @@ func serviceAction(action, name string) error {
 	if err := sm.Action(action, name); err != nil {
 		return err
 	}
+	if action == "start" || action == "restart" {
+		time.Sleep(2 * time.Second)
+		if state := sm.State(name); state != "active" {
+			return fmt.Errorf("%s became %s after %s; inspect sundy service status %s", name, state, action, name)
+		}
+	}
 	ui.Success(action + " completed for " + name)
 	return nil
 }
@@ -772,10 +835,12 @@ func contains(a []string, v string) bool {
 }
 func oneLine(s string, n int) string {
 	s = strings.ReplaceAll(strings.TrimSpace(s), "\n", " | ")
-	if len(s) > n {
-		return s[:n] + "…"
+	runes := []rune(s)
+	if n < 0 {
+		n = 0
+	}
+	if len(runes) > n {
+		return string(runes[:n]) + "…"
 	}
 	return s
 }
-
-func init() { _ = filepath.Separator }

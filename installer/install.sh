@@ -18,7 +18,7 @@ case "$(uname -s)" in Linux) ;; *) fail "Sundy Toolkit currently supports Linux 
 case "$(uname -m)" in
   x86_64|amd64) arch=amd64 ;;
   aarch64|arm64) arch=arm64 ;;
-  armv7l|armv6l) arch=arm ;;
+  armv7l) arch=arm ;;
   riscv64) arch=riscv64 ;;
   *) fail "Unsupported architecture: $(uname -m)" ;;
 esac

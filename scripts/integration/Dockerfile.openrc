@@ -1,0 +1,5 @@
+FROM alpine:3.22
+RUN apk add --no-cache openrc openjdk21-jre-headless grep
+COPY bin/sundy /usr/local/bin/sundy
+COPY scripts/integration/openrc.sh /integration.sh
+ENTRYPOINT ["sh", "/integration.sh"]

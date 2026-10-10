@@ -1,16 +1,18 @@
 package install
 
 import (
-	"archive/tar"
-	"compress/gzip"
 	"crypto/rand"
+	"crypto/sha512"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/mail"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -24,8 +26,14 @@ func InstallWings() error {
 		return err
 	}
 	p := platform.Detect()
+	if p.Init != "systemd" {
+		return fmt.Errorf("Wings service installation requires systemd")
+	}
+	if runtime.GOARCH != "amd64" && runtime.GOARCH != "arm64" {
+		return fmt.Errorf("Wings preset currently supports amd64/arm64")
+	}
 	if p.ID != "ubuntu" && p.ID != "debian" {
-		return fmt.Errorf("Pterodactyl Wings is officially supported on Ubuntu/Debian; detected %s", p.Name)
+		return fmt.Errorf("the Wings preset is limited to Ubuntu/Debian; detected %s", p.Name)
 	}
 	if !util.Exists("docker") {
 		dp, _ := Find("docker")
@@ -59,8 +67,6 @@ LimitNOFILE=4096
 PIDFile=/var/run/wings/daemon.pid
 ExecStart=/usr/local/bin/wings
 Restart=on-failure
-StartLimitInterval=180
-StartLimitBurst=30
 RestartSec=5s
 
 [Install]
@@ -86,25 +92,51 @@ WantedBy=multi-user.target
 // It creates the database, installs dependencies, configures NGINX/queue worker, and leaves only
 // account creation and optional TLS to the operator.
 func InstallPanelStable(domain, email string) (string, error) {
+	if err := validatePanelInput(domain, email); err != nil {
+		return "", err
+	}
 	if err := util.RequireRoot(); err != nil {
 		return "", err
 	}
 	p := platform.Detect()
 	if p.ID != "ubuntu" || !strings.HasPrefix(p.Version, "24.04") {
-		return "", fmt.Errorf("the fully automated native Panel preset is intentionally limited to Ubuntu 24.04; use the guided/manual preset on other supported systems")
+		return "", fmt.Errorf("the fully automated native Panel preset is intentionally limited to Ubuntu 24.04; follow the upstream manual installation instructions on other systems")
 	}
+	if p.Init != "systemd" {
+		return "", fmt.Errorf("native Panel installation requires systemd")
+	}
+	root := "/var/www/pterodactyl"
+	entries, err := os.ReadDir(root)
+	if err != nil && !os.IsNotExist(err) {
+		return "", err
+	}
+	if len(entries) > 0 {
+		return "", fmt.Errorf("%s is not empty; this installer only supports new installations and will not replace an existing Panel or APP_KEY", root)
+	}
+	work, err := os.MkdirTemp("", "sundy-panel-*")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(work)
 	pm := platform.Packages()
-	deps := []string{"php8.3", "php8.3-common", "php8.3-cli", "php8.3-gd", "php8.3-mysql", "php8.3-mbstring", "php8.3-bcmath", "php8.3-xml", "php8.3-fpm", "php8.3-curl", "php8.3-zip", "php8.3-intl", "mariadb-server", "redis-server", "tar", "unzip", "curl", "nginx"}
+	deps := []string{"php8.3", "php8.3-common", "php8.3-cli", "php8.3-gd", "php8.3-mysql", "php8.3-mbstring", "php8.3-bcmath", "php8.3-xml", "php8.3-fpm", "php8.3-curl", "php8.3-zip", "php8.3-intl", "mariadb-server", "redis-server", "tar", "unzip", "curl", "nginx", "cron"}
 	if err := pm.Install(deps...); err != nil {
 		return "", err
 	}
-	_ = platform.Services().Action("enable", "mariadb")
-	_ = platform.Services().Action("start", "mariadb")
-	_ = platform.Services().Action("enable", "redis-server")
-	_ = platform.Services().Action("start", "redis-server")
+	for _, svc := range []string{"mariadb", "redis-server"} {
+		if err := platform.Services().Action("enable", svc); err != nil {
+			return "", err
+		}
+		if err := platform.Services().Action("start", svc); err != nil {
+			return "", err
+		}
+	}
 	if !util.Exists("composer") {
-		tmp := "/tmp/sundy-composer-setup.php"
+		tmp := filepath.Join(work, "composer-setup.php")
 		if err := download("https://getcomposer.org/installer", tmp, 0644); err != nil {
+			return "", err
+		}
+		if err := verifyComposerInstaller(tmp, filepath.Join(work, "installer.sig")); err != nil {
 			return "", err
 		}
 		if err := util.RunStreaming("php", tmp, "--install-dir=/usr/local/bin", "--filename=composer"); err != nil {
@@ -112,19 +144,17 @@ func InstallPanelStable(domain, email string) (string, error) {
 		}
 		_ = os.Remove(tmp)
 	}
-	root := "/var/www/pterodactyl"
 	if err := os.MkdirAll(root, 0755); err != nil {
 		return "", err
 	}
-	tgz := "/tmp/pterodactyl-panel.tar.gz"
-	panelURL, panelVersion, err := githubReleaseAsset("pterodactyl/panel", "v1.", "panel.tar.gz")
+	tgz := filepath.Join(work, "panel.tar.gz")
+	panelURL, _, err := githubReleaseAsset("pterodactyl/panel", "v1.", "panel.tar.gz")
 	if err != nil {
 		return "", fmt.Errorf("resolve stable Pterodactyl 1.x release: %w", err)
 	}
 	if err := download(panelURL, tgz, 0644); err != nil {
 		return "", err
 	}
-	_ = panelVersion
 	if err := extractTGZ(tgz, root); err != nil {
 		return "", err
 	}
@@ -144,7 +174,7 @@ func InstallPanelStable(domain, email string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	sql := fmt.Sprintf("CREATE DATABASE IF NOT EXISTS panel; CREATE USER IF NOT EXISTS 'pterodactyl'@'127.0.0.1' IDENTIFIED BY '%s'; GRANT ALL PRIVILEGES ON panel.* TO 'pterodactyl'@'127.0.0.1'; FLUSH PRIVILEGES;", pass)
+	sql := fmt.Sprintf("CREATE DATABASE panel; CREATE USER 'pterodactyl'@'127.0.0.1' IDENTIFIED BY '%s'; GRANT ALL PRIVILEGES ON panel.* TO 'pterodactyl'@'127.0.0.1'; FLUSH PRIVILEGES;", pass)
 	dbcli := "mysql"
 	if util.Exists("mariadb") {
 		dbcli = "mariadb"
@@ -153,19 +183,18 @@ func InstallPanelStable(domain, email string) (string, error) {
 	if r.Code != 0 {
 		return "", fmt.Errorf("database setup failed: %s", r.Stderr)
 	}
-	setupArgs := []string{"artisan", "p:environment:setup", "--author=" + email, "--url=https://" + domain, "--timezone=UTC", "--cache=redis", "--session=redis", "--queue=redis", "--redis-host=127.0.0.1", "--redis-port=6379", "--settings-ui=true"}
+	setupArgs := []string{"artisan", "p:environment:setup", "--author=" + email, "--url=http://" + domain, "--timezone=UTC", "--cache=redis", "--session=redis", "--queue=redis", "--redis-host=127.0.0.1", "--redis-port=6379", "--settings-ui=true", "--telemetry=false", "--redis-pass=", "--no-interaction"}
 	if err := util.RunStreamingDir(root, "php", setupArgs...); err != nil {
 		return "", err
 	}
-	dbArgs := []string{"artisan", "p:environment:database", "--host=127.0.0.1", "--port=3306", "--database=panel", "--username=pterodactyl", "--password=" + pass}
+	dbArgs := []string{"artisan", "p:environment:database", "--host=127.0.0.1", "--port=3306", "--database=panel", "--username=pterodactyl", "--password=" + pass, "--no-interaction"}
 	if err := util.RunStreamingDir(root, "php", dbArgs...); err != nil {
 		return "", err
 	}
 	if err := util.RunStreamingDir(root, "php", "artisan", "migrate", "--seed", "--force"); err != nil {
 		return "", err
 	}
-	_ = os.Chmod(filepath.Join(root, "storage"), 0755)
-	_ = os.Chmod(filepath.Join(root, "bootstrap", "cache"), 0755)
+
 	nginx := fmt.Sprintf(`server {
     listen 80;
     server_name %s;
@@ -197,8 +226,6 @@ User=www-data
 Group=www-data
 Restart=always
 ExecStart=/usr/bin/php /var/www/pterodactyl/artisan queue:work --queue=high,standard,low --sleep=3 --tries=3
-StartLimitInterval=180
-StartLimitBurst=30
 RestartSec=5s
 
 [Install]
@@ -211,12 +238,28 @@ WantedBy=multi-user.target
 	if err := os.WriteFile("/etc/cron.d/pterodactyl", []byte(cron), 0644); err != nil {
 		return "", err
 	}
-	_ = util.RunStreaming("chown", "-R", "www-data:www-data", root)
-	_ = util.RunStreaming("systemctl", "daemon-reload")
-	_ = util.RunStreaming("systemctl", "enable", "--now", "pteroq")
-	_ = util.RunStreaming("systemctl", "enable", "--now", "nginx")
+	if err := util.RunStreaming("chown", "-R", "www-data:www-data", root); err != nil {
+		return "", err
+	}
+	if err := os.Chmod(filepath.Join(root, ".env"), 0640); err != nil {
+		return "", err
+	}
 	if r := util.Run(8*time.Second, "nginx", "-t"); r.Code != 0 {
 		return "", fmt.Errorf("nginx validation failed: %s", r.Stderr)
+	}
+	if err := util.RunStreaming("systemctl", "daemon-reload"); err != nil {
+		return "", err
+	}
+	for _, svc := range []string{"php8.3-fpm", "cron", "pteroq", "nginx"} {
+		if err := platform.Services().Action("enable", svc); err != nil {
+			return "", err
+		}
+		if err := platform.Services().Action("restart", svc); err != nil {
+			return "", err
+		}
+		if state := platform.Services().State(svc); state != "active" {
+			return "", fmt.Errorf("%s did not become active: %s", svc, state)
+		}
 	}
 	return pass, nil
 }
@@ -273,11 +316,12 @@ func download(url, dst string, mode os.FileMode) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
 		return err
 	}
-	tmp := dst + ".part"
-	f, e := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode)
+	f, e := os.CreateTemp(filepath.Dir(dst), ".sundy-download-*")
 	if e != nil {
 		return e
 	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
 	_, cp := io.Copy(f, r.Body)
 	ce := f.Close()
 	if cp != nil {
@@ -291,56 +335,48 @@ func download(url, dst string, mode os.FileMode) error {
 	}
 	return os.Rename(tmp, dst)
 }
-func extractTGZ(src, dst string) error {
-	f, e := os.Open(src)
-	if e != nil {
-		return e
-	}
-	defer f.Close()
-	gz, e := gzip.NewReader(f)
-	if e != nil {
-		return e
-	}
-	defer gz.Close()
-	tr := tar.NewReader(gz)
-	for {
-		h, e := tr.Next()
-		if e == io.EOF {
-			break
-		}
-		if e != nil {
-			return e
-		}
-		target := filepath.Join(dst, filepath.Clean(h.Name))
-		if !strings.HasPrefix(target, filepath.Clean(dst)+string(os.PathSeparator)) && target != filepath.Clean(dst) {
-			return fmt.Errorf("unsafe archive path")
-		}
-		switch h.Typeflag {
-		case tar.TypeDir:
-			if e := os.MkdirAll(target, os.FileMode(h.Mode)); e != nil {
-				return e
-			}
-		case tar.TypeReg:
-			if e := os.MkdirAll(filepath.Dir(target), 0755); e != nil {
-				return e
-			}
-			w, e := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(h.Mode))
-			if e != nil {
-				return e
-			}
-			_, e = io.Copy(w, tr)
-			w.Close()
-			if e != nil {
-				return e
-			}
-		}
-	}
-	return nil
-}
+func extractTGZ(src, dst string) error { return util.ExtractTGZ(src, dst) }
 func randomPassword() (string, error) {
 	b := make([]byte, 24)
 	if _, e := rand.Read(b); e != nil {
 		return "", e
 	}
 	return strings.TrimRight(base64.RawURLEncoding.EncodeToString(b), "="), nil
+}
+
+var domainRx = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$`)
+
+func validatePanelInput(domain, email string) error {
+	if !domainRx.MatchString(domain) {
+		return fmt.Errorf("enter a hostname without a scheme, port or path")
+	}
+	for _, label := range strings.Split(domain, ".") {
+		if label == "" || len(label) > 63 || strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+			return fmt.Errorf("invalid domain name")
+		}
+	}
+	address, err := mail.ParseAddress(email)
+	if err != nil || address.Address != email || strings.ContainsAny(email, "\r\n") {
+		return fmt.Errorf("invalid contact email")
+	}
+	return nil
+}
+
+func verifyComposerInstaller(installer, signature string) error {
+	if err := download("https://composer.github.io/installer.sig", signature, 0600); err != nil {
+		return err
+	}
+	want, err := os.ReadFile(signature)
+	if err != nil {
+		return err
+	}
+	data, err := os.ReadFile(installer)
+	if err != nil {
+		return err
+	}
+	got := sha512.Sum384(data)
+	if !strings.EqualFold(strings.TrimSpace(string(want)), hex.EncodeToString(got[:])) {
+		return fmt.Errorf("Composer installer checksum mismatch")
+	}
+	return nil
 }

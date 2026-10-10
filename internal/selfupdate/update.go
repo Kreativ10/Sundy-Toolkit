@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-const repo = "https://github.com/SundySystems/sundy-toolkit"
+const repo = "https://github.com/Kreativ10/Sundy-Toolkit"
 
 func Run() error {
 	arch := runtime.GOARCH
@@ -51,18 +51,23 @@ func Run() error {
 	if err != nil {
 		return err
 	}
-	exe, _ = filepath.EvalSymlinks(exe)
+	exe, err = filepath.EvalSymlinks(exe)
+	if err != nil {
+		return err
+	}
 	dir := filepath.Dir(exe)
-	targetTmp := filepath.Join(dir, ".sundy-update.tmp")
+
 	src, err := os.Open(bin)
 	if err != nil {
 		return err
 	}
 	defer src.Close()
-	f, err := os.OpenFile(targetTmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0755)
+	f, err := os.CreateTemp(dir, ".sundy-update-*")
 	if err != nil {
 		return fmt.Errorf("cannot write next to %s; re-run `sudo sundy update` or use the installer: %w", exe, err)
 	}
+	targetTmp := f.Name()
+	defer os.Remove(targetTmp)
 	_, cp := io.Copy(f, src)
 	ce := f.Close()
 	if cp != nil {
@@ -116,6 +121,9 @@ func findChecksum(path, asset string) (string, error) {
 		if len(p) >= 2 && strings.TrimPrefix(p[len(p)-1], "*") == asset {
 			return p[0], nil
 		}
+	}
+	if err := s.Err(); err != nil {
+		return "", err
 	}
 	return "", fmt.Errorf("checksum for %s not found", asset)
 }

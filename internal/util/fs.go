@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"syscall"
 )
 
 func EnsureDir(path string, mode os.FileMode) error { return os.MkdirAll(path, mode) }
@@ -14,11 +15,38 @@ func AtomicWrite(path string, data []byte, mode os.FileMode) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, mode); err != nil {
+	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*.tmp")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	defer os.Remove(f.Name())
+	// Root-run configuration edits retain an existing file's ownership.
+	if os.Geteuid() == 0 {
+		if previous, err := os.Stat(path); err == nil {
+			if stat, ok := previous.Sys().(*syscall.Stat_t); ok {
+				if err := f.Chown(int(stat.Uid), int(stat.Gid)); err != nil {
+					f.Close()
+					return err
+				}
+			}
+		}
+	}
+	if err := f.Chmod(mode); err != nil {
+		f.Close()
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), path)
 }
 
 func WriteJSON(path string, v any, mode os.FileMode) error {
