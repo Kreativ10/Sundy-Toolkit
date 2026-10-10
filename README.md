@@ -52,6 +52,22 @@ curl -fsSL https://raw.githubusercontent.com/Kreativ10/Sundy-Toolkit/main/instal
 
 Set `SUNDY_VERSION=v0.1.0` on the **`sh` side of the pipe** to choose a release, or `SUNDY_REPO=owner/repository` to use another release repository. Add your installation directory to `PATH` when using a custom location.
 
+### Upgrade from 0.1.1 when `update` returns 404
+
+The 0.1.1 updater uses the old repository address. Replace the binary with the installer from the current repository. For the default installation, run as root:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Kreativ10/Sundy-Toolkit/main/installer/install.sh \
+  | SUNDY_VERSION=v0.1.2 sh
+hash -r
+/usr/local/bin/sundy version
+/usr/local/bin/sundy apps
+```
+
+Uninstalling first is unnecessary. The installer checks SHA-256 and replaces only the binary; `/var/lib/sundy/apps.json`, server directories and worlds remain. Back up the registry before replacing the binary; worlds need separate backups. For a custom installation, set `SUNDY_INSTALL_DIR` to the existing directory: services use the absolute binary path. Running supervisors use the old version until their service restarts; restart servers individually after checking their logs.
+
+If the list is empty, check that you are root and using the same `SUNDY_STATE_DIR`: a different state directory shows a different registry. Updating the binary cannot recover entries already lost. Preserve the current registry and inspect existing services and directories before registering servers again; never create a new Vanilla server inside an existing world's directory.
+
 ### Build from source
 
 Requires Go 1.23+ and Make. The resulting binary does not need a Go installation.

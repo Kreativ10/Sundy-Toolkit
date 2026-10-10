@@ -98,6 +98,64 @@ done
 	}
 }
 
+func TestMultipleInstancesKeepIndependentConsoles(t *testing.T) {
+	state, run := t.TempDir(), t.TempDir()
+	t.Setenv("SUNDY_STATE_DIR", state)
+	t.Setenv("SUNDY_RUNTIME_DIR", run)
+	type instance struct {
+		app  apps.App
+		done chan error
+	}
+	var instances []instance
+	for i, name := range []string{"first", "second"} {
+		a := testApp(t, "while IFS= read -r line; do printf '"+name+":%s\\n' \"$line\"; [ \"$line\" = stop ] && exit 0; done\n")
+		a.ID, a.Name, a.Port = "minecraft-"+name, name, 25565+i
+		if err := apps.Save(a); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := make(chan error, 1)
+		go func() {
+			registered, err := minecraftApp(a.Name)
+			if err != nil {
+				done <- err
+				return
+			}
+			done <- runSupervisor(ctx, registered, runtimeDir(), filepath.Join(state, "minecraft", a.Name), time.Second)
+		}()
+		instances = append(instances, instance{a, done})
+	}
+	list, err := apps.List()
+	if err != nil || len(list) != 2 {
+		t.Fatalf("second registration lost an instance: %v %v", list, err)
+	}
+	connections := make([]net.Conn, len(instances))
+	for i, in := range instances {
+		conn := connectConsole(t, filepath.Join(run, in.app.Name+".sock"))
+		connections[i] = conn
+		defer conn.Close()
+	}
+	// Both consoles are connected before either server stops. The second must
+	// still answer commands after stopping the first.
+	for i, in := range instances {
+		conn := connections[i]
+		fmt.Fprintln(conn, "list")
+		line, err := bufio.NewReader(conn).ReadString('\n')
+		if err != nil || line != in.app.Name+":list\n" {
+			t.Fatalf("%s console: %q %v", in.app.Name, line, err)
+		}
+		fmt.Fprintln(conn, "stop")
+		waitSupervisor(t, in.done, true)
+	}
+	for _, in := range instances {
+		data, err := os.ReadFile(filepath.Join(state, "minecraft", in.app.Name, "console.log"))
+		if err != nil || string(data) != in.app.Name+":list\n"+in.app.Name+":stop\n" {
+			t.Fatalf("%s log: %q %v", in.app.Name, data, err)
+		}
+	}
+}
+
 func TestSupervisorPreservesLargeAndFinalOutput(t *testing.T) {
 	a := testApp(t, "head -c 1500000 /dev/zero | tr '\\000' x\nprintf '\\nfinal stdout\\n'\nprintf 'final stderr\\n' >&2\n")
 	logs := t.TempDir()

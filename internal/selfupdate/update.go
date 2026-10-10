@@ -96,7 +96,10 @@ func download(url, dst string) error {
 	}
 	defer r.Body.Close()
 	if r.StatusCode/100 != 2 {
-		return fmt.Errorf("download returned %s", r.Status)
+		if r.StatusCode == http.StatusNotFound {
+			return fmt.Errorf("release asset not found (404): %s; check %s/releases for a release with this architecture and checksums.txt, or reinstall using installer/install.sh", url, repo)
+		}
+		return fmt.Errorf("download %s returned %s", url, r.Status)
 	}
 	f, e := os.Create(dst)
 	if e != nil {

@@ -1,8 +1,11 @@
 package selfupdate
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -25,5 +28,19 @@ func TestReleaseRepoAndChecksum(t *testing.T) {
 	}
 	if _, err := findChecksum(sums, "missing"); err == nil {
 		t.Fatal("accepted missing checksum")
+	}
+}
+
+func TestMissingReleaseExplainsRecovery(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	dst := filepath.Join(t.TempDir(), "sundy")
+	url := server.URL + "/releases/latest/download/sundy-linux-amd64"
+	err := download(url, dst)
+	if err == nil || !strings.Contains(err.Error(), url) || !strings.Contains(err.Error(), "reinstall") {
+		t.Fatalf("missing actionable release error: %v", err)
+	}
+	if _, err := os.Stat(dst); !os.IsNotExist(err) {
+		t.Fatalf("failed download created a binary: %v", err)
 	}
 }

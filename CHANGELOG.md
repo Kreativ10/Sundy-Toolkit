@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add simultaneous Minecraft instance regression checks for registration, menu selection, independent consoles and stopping one server while another remains available.
+- Explain release download failures with the requested URL and recovery instructions; document migration from the broken 0.1.1 updater in both languages.
+
 - Fix Minecraft relative JAR paths, version-aware Java checks, explicit Java selection, heap validation and existing-instance protection.
 - Split Minecraft installation, downloads, Java detection, service generation and runtime management into focused modules.
 - Add graceful shutdown, duplicate-supervisor locking, bounded console queues and complete stdout/stderr capture.

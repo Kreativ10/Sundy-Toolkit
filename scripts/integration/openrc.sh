@@ -60,5 +60,29 @@ until grep -q 'Done (' /var/lib/sundy/minecraft/existing-smoke/console.log 2>/de
  if [ "$count" -gt 120 ]; then exit 1; fi
  sleep 1
 done
+# Both instances must stay registered and usable while running together.
+rm /var/lib/sundy/minecraft/openrc-smoke/console.log
+sundy minecraft start openrc-smoke
+wait_ready
+sundy apps > /tmp/apps-output
+grep '^openrc-smoke ' /tmp/apps-output
+grep '^existing-smoke ' /tmp/apps-output
+# Select the second server in the actual interactive manager.
+printf '3\n2\n' | sundy minecraft > /tmp/manager-output
+grep 'sundy-minecraft-existing-smoke is active' /tmp/manager-output
+for instance in openrc-smoke existing-smoke; do
+ (printf 'say console-%s\nlist\n' "$instance"; sleep 2; printf ':detach\n') \
+   | sundy minecraft console "$instance" > "/tmp/console-$instance"
+ grep "console-$instance" "/tmp/console-$instance"
+ grep 'players online' "/tmp/console-$instance"
+ sundy minecraft status "$instance"
+done
+if grep 'console-existing-smoke' /var/lib/sundy/minecraft/openrc-smoke/console.log; then exit 1; fi
+if grep 'console-openrc-smoke' /var/lib/sundy/minecraft/existing-smoke/console.log; then exit 1; fi
+sundy minecraft stop openrc-smoke
+rc-service sundy-minecraft-existing-smoke status
+(printf 'list\n'; sleep 2; printf ':detach\n') | sundy minecraft console existing-smoke > /tmp/remaining-console
+grep 'players online' /tmp/remaining-console
 sundy minecraft stop existing-smoke
-printf 'OpenRC real Minecraft creation/registration/start/console/stop/restart passed\n' 
+test -f '/srv/minecraft/relative server/world/level.dat'
+printf 'OpenRC real Minecraft creation/registration/start/console/stop/restart and simultaneous instances passed\n'
